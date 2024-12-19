@@ -435,7 +435,8 @@ class PPOTrainer(Trainer):
 
                     if ref_policy is None:
                         with self.null_ref_context():
-                            ref_output = forward(model.policy, query_response, processing_class.pad_token_id)
+                            # FIXME: should this be wrapped?
+                            ref_output = forward(self.accelerator.unwrap_model(model).policy, query_response, processing_class.pad_token_id)
                     else:
                         ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
                     ref_logits = ref_output.logits[:, context_length - 1 : -1]

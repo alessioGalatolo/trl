@@ -33,6 +33,10 @@ class OnlineDPOConfig(TrainingArguments):
             [`~transformers.TrainingArguments`].
         reward_model_path (`Optional[str]`, *optional*, defaults to `None`):
             Path to the reward model. Either `judge` or `reward_model_path` must be set, but not both.
+        model_adapter_name (`Optional[str]`, *optional*, defaults to `None`):
+            Name of the train target PEFT adapter, when using LoRA with multiple adapters.
+        ref_adapter_name (`Optional[str]`, *optional*, defaults to `None`):
+            Name of the reference PEFT adapter, when using LoRA with multiple adapters.
         judge (`Optional[str]`, *optional*, defaults to `None`):
             Name of the judge to use. Either `judge` or `reward_model_path` must be set, but not both.
         max_new_tokens (`int`, *optional*, defaults to `64`):
@@ -62,6 +66,8 @@ class OnlineDPOConfig(TrainingArguments):
 
     learning_rate: float = 5e-7
     reward_model_path: Optional[str] = None
+    model_adapter_name: Optional[str] = None
+    ref_adapter_name: Optional[str] = None
     judge: Optional[str] = None
     max_new_tokens: int = 64
     temperature: float = 0.9

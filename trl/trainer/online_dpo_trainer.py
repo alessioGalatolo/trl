@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager, nullcontext
 import os
 import textwrap
 import warnings
@@ -200,17 +201,20 @@ class OnlineDPOTrainer(Trainer):
         if args.disable_dropout:
             disable_dropout_in_model(model)
 
+        
+        self.is_peft_model = is_peft_available() and isinstance(model, PeftModel)
+        self.model_adapter_name = args.model_adapter_name
+        self.ref_adapter_name = args.ref_adapter_name
         # Handle the ref_model
         # Usually, the user wants the ref model to be the initial version of the model. When using PEFT, it's easy to
         # get the ref model, as it's just the model with a disabled adapter. When not using PEFT, we need to create
         # the ref model from the model by copying it and disable the gradients and set it in evaluation mode.
-        if ref_model is None:  # No ref model provided, the most common case
-            if peft_config is None:
-                self.ref_model = create_reference_model(model)  # copy, disable gradients, set eval mode
-            else:
-                self.ref_model = None  # we don't need a ref model here, we can just disable the adapter.
-        else:  # rare case, the user provided a ref model
+        if ref_model:
             self.ref_model = ref_model
+        elif self.is_peft_model:
+            self.ref_model = None
+        else:
+            self.ref_model = create_reference_model(model)
             self.ref_model.eval()
 
         # Disable the gradient and set the reward model in eval mode
@@ -388,6 +392,18 @@ class OnlineDPOTrainer(Trainer):
 
         return self.accelerator.prepare(eval_dataloader)
 
+    @contextmanager
+    def null_ref_context(self):
+        """Context manager for handling null reference model (that is, peft adapter manipulation)."""
+        with self.accelerator.unwrap_model(
+            self.model
+        ).disable_adapter() if self.is_peft_model and not self.ref_adapter_name else nullcontext():
+            if self.ref_adapter_name:
+                self.model.set_adapter(self.ref_adapter_name)
+            yield
+            if self.ref_adapter_name:
+                self.model.set_adapter(self.model_adapter_name or "default")
+
     def training_step(
         self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch: Optional[int] = None
     ) -> torch.Tensor:
@@ -438,7 +454,7 @@ class OnlineDPOTrainer(Trainer):
             if self.ref_model is not None:
                 ref_output = self.ref_model(prompt_completion_ids, attention_mask=prompt_completion_mask)
             else:  # peft case: we just need to disable the adapter
-                with self.model.disable_adapter():
+                with self.null_ref_context():
                     ref_output = self.model(prompt_completion_ids, attention_mask=prompt_completion_mask)
             ref_logits = ref_output.logits[:, context_length - 1 : -1]
             ref_all_logprobs = F.log_softmax(ref_logits, dim=-1)

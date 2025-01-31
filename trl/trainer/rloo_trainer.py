@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import contextmanager, nullcontext
 import gc
 import math
 import os
@@ -44,7 +45,9 @@ from transformers import (
 from transformers.integrations import get_reporting_integration_callbacks
 from transformers.trainer import DEFAULT_CALLBACKS, DEFAULT_PROGRESS_CALLBACK
 from transformers.trainer_callback import CallbackHandler, ExportableState, PrinterCallback
+from transformers.utils import is_peft_available
 
+from ..models import create_reference_model
 from ..models.utils import unwrap_model_for_generation
 from ..trainer.utils import (
     OnlineTrainerState,
@@ -61,6 +64,8 @@ from ..trainer.utils import (
 from .rloo_config import RLOOConfig
 from .utils import generate_model_card, get_comet_experiment_url, log_table_to_comet_experiment
 
+if is_peft_available():
+    from peft import PeftConfig, PeftModel, get_peft_model
 
 if is_wandb_available():
     import wandb
@@ -107,7 +112,6 @@ class RLOOTrainer(Trainer):
         )
         self.policy.generation_config.pad_token_id = None  # generate tokens without truncation / padding
 
-        self.ref_policy = ref_policy
         self.reward_model = reward_model
         self.train_dataset = train_dataset
         self.train_dataset_len = len(train_dataset)
@@ -115,6 +119,10 @@ class RLOOTrainer(Trainer):
         self.eval_dataset = eval_dataset
         self.optimizer, self.lr_scheduler = optimizers
         self.optimizer_cls_and_kwargs = None  # needed for transformers >= 4.47
+
+        self.model_adapter_name = args.model_adapter_name
+        self.ref_adapter_name = args.ref_adapter_name
+        self.is_peft_model = is_peft_available() and isinstance(self.policy_model, PeftModel)
 
         #########
         # calculate various batch sizes
@@ -152,6 +160,8 @@ class RLOOTrainer(Trainer):
         # setup model, optimizer, and others
         #########
         for module in [policy, ref_policy, reward_model]:
+            if module is None:  # allow `ref_policy` to be `None` if using PEFT
+                continue
             disable_dropout_in_model(module)
         if args.stop_token and args.stop_token == "eos":
             args.stop_token_id = self.processing_class.eos_token_id
@@ -159,7 +169,12 @@ class RLOOTrainer(Trainer):
         self.create_optimizer_and_scheduler(
             num_training_steps=args.num_total_batches
         )  # note that we are calling `self.lr_scheduler.step()` manually only at the batch level
-
+        if ref_policy:
+            self.ref_policy = ref_policy
+        elif self.is_peft_model:
+            self.ref_policy = None
+        else:
+            self.ref_policy = create_reference_model(self.model)
         #########
         ### trainer specifics
         #########
@@ -222,12 +237,20 @@ class RLOOTrainer(Trainer):
             self.reward_model = prepare_deepspeed(
                 self.reward_model, args.per_device_train_batch_size, args.fp16, args.bf16
             )
-            self.ref_policy = prepare_deepspeed(
-                self.ref_policy, args.per_device_train_batch_size, args.fp16, args.bf16
-            )
+            if self.ref_policy is None:
+                if not self.is_peft_model:
+                    raise ValueError("No reference model and model is not a Peft model.")
+            else:
+                self.ref_policy = prepare_deepspeed(
+                    self.ref_policy, args.per_device_train_batch_size, args.fp16, args.bf16
+                )
             self.deepspeed = self.model
         else:
-            self.ref_policy = self.ref_policy.to(self.accelerator.device)
+            if self.ref_policy is None:
+                if not self.is_peft_model:
+                    raise ValueError("No reference model and model is not a Peft model.")
+            else:
+                self.ref_policy = self.ref_policy.to(self.accelerator.device)
             self.reward_model = self.reward_model.to(self.accelerator.device)
 
     def get_train_dataloader(self) -> DataLoader:
@@ -235,6 +258,18 @@ class RLOOTrainer(Trainer):
 
     def get_eval_dataloader(self) -> DataLoader:
         return self.eval_dataloader
+
+    @contextmanager
+    def null_ref_context(self):
+        """Context manager for handling null reference model (that is, peft adapter manipulation)."""
+        with self.accelerator.unwrap_model(
+            self.model
+        ).disable_adapter() if self.is_peft_model and not self.ref_adapter_name else nullcontext():
+            if self.ref_adapter_name:
+                self.model.set_adapter(self.ref_adapter_name)
+            yield
+            if self.ref_adapter_name:
+                self.model.set_adapter(self.model_adapter_name or "default")
 
     def train(self):
         args = self.args
@@ -327,7 +362,11 @@ class RLOOTrainer(Trainer):
                     del logits, all_logprob
                     torch.cuda.empty_cache()
 
-                    ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
+                    if ref_policy is None:
+                        with self.null_ref_context():
+                            ref_output = forward(model, query_response, processing_class.pad_token_id)
+                    else:
+                        ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
                     ref_logits = ref_output.logits[:, context_length - 1 : -1]
                     ref_logits /= args.temperature + 1e-7
                     ref_all_logprob = F.log_softmax(ref_logits, dim=-1)

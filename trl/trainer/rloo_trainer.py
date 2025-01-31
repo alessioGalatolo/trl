@@ -122,7 +122,7 @@ class RLOOTrainer(Trainer):
 
         self.model_adapter_name = args.model_adapter_name
         self.ref_adapter_name = args.ref_adapter_name
-        self.is_peft_model = is_peft_available() and isinstance(self.policy_model, PeftModel)
+        self.is_peft_model = is_peft_available() and isinstance(policy, PeftModel)
 
         #########
         # calculate various batch sizes

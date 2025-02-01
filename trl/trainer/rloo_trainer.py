@@ -262,14 +262,13 @@ class RLOOTrainer(Trainer):
     @contextmanager
     def null_ref_context(self):
         """Context manager for handling null reference model (that is, peft adapter manipulation)."""
-        with self.accelerator.unwrap_model(
-            self.model
-        ).disable_adapter() if self.is_peft_model and not self.ref_adapter_name else nullcontext():
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        with unwrapped_model.disable_adapter() if self.is_peft_model and not self.ref_adapter_name else nullcontext():
             if self.ref_adapter_name:
-                self.model.set_adapter(self.ref_adapter_name)
+                unwrapped_model.set_adapter(self.ref_adapter_name)
             yield
             if self.ref_adapter_name:
-                self.model.set_adapter(self.model_adapter_name or "default")
+                unwrapped_model.set_adapter(self.model_adapter_name or "default")
 
     def train(self):
         args = self.args

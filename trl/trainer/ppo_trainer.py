@@ -313,14 +313,13 @@ class PPOTrainer(Trainer):
     @contextmanager
     def null_ref_context(self):
         """Context manager for handling null reference model (that is, peft adapter manipulation)."""
-        with self.accelerator.unwrap_model(
-            self.model
-        ).policy.disable_adapter() if self.is_peft_model and not self.ref_adapter_name else nullcontext():
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        with unwrapped_model.policy.disable_adapter() if self.is_peft_model and not self.ref_adapter_name else nullcontext():
             if self.ref_adapter_name:
-                self.model.policy.set_adapter(self.ref_adapter_name)
+                unwrapped_model.policy.set_adapter(self.ref_adapter_name)
             yield
             if self.ref_adapter_name:
-                self.model.policy.set_adapter(self.model_adapter_name or "default")
+                unwrapped_model.policy.set_adapter(self.model_adapter_name or "default")
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
         backup_model = self.model

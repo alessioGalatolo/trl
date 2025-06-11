@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -394,7 +394,7 @@ class PreTrainedModelWrapper(nn.Module):
     @classmethod
     def _get_current_device(cls):
         r"""
-        Get the current device. For GPU, we return the local process index using the `accelerate.PartialState`
+        Get the current device. For GPU & XPU, we return the local process index using the `accelerate.PartialState`
         object to handle corner cases when running scripts in distributed environments.
 
         Returns:
@@ -402,12 +402,12 @@ class PreTrainedModelWrapper(nn.Module):
                 The current device.
         """
         state = PartialState()
-        if is_torch_xpu_available():
-            return f"xpu:{state.local_process_index}"
+        if torch.cuda.is_available() or is_torch_xpu_available():
+            return state.local_process_index
         elif is_torch_npu_available():
             return f"npu:{state.local_process_index}"
         else:
-            return state.local_process_index if torch.cuda.is_available() else "cpu"
+            return "cpu"
 
     @classmethod
     def _split_kwargs(cls, kwargs):
@@ -474,8 +474,7 @@ class PreTrainedModelWrapper(nn.Module):
                         )
                     except Exception as exc:
                         raise ValueError(
-                            "Could not find adapter model in the Hub, "
-                            "make sure you have the correct adapter model id."
+                            "Could not find adapter model in the Hub, make sure you have the correct adapter model id."
                         ) from exc
                 else:
                     local_filename = filename

@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,17 +13,13 @@
 # limitations under the License.
 
 import os
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import pandas as pd
 import torch
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
-from accelerate.utils import gather_object, is_deepspeed_available
-from rich.console import Console, Group
-from rich.live import Live
-from rich.panel import Panel
-from rich.progress import Progress
+from accelerate.utils import gather_object, is_wandb_available
 from transformers import (
     GenerationConfig,
     PreTrainedModel,
@@ -34,8 +30,8 @@ from transformers import (
     TrainerState,
     TrainingArguments,
 )
-from transformers.integrations import WandbCallback
 from transformers.trainer_utils import has_length
+from transformers.utils import is_rich_available
 
 from ..data_utils import maybe_apply_chat_template
 from ..import_utils import is_mergekit_available
@@ -45,8 +41,14 @@ from .judges import BasePairwiseJudge
 from .utils import log_table_to_comet_experiment
 
 
-if is_deepspeed_available():
-    import deepspeed
+if is_rich_available():
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.progress import Progress
+
+if is_wandb_available():
+    import wandb
 
 
 def _generate_completions(
@@ -89,6 +91,10 @@ def _generate_completions(
 
 
 class SyncRefModelCallback(TrainerCallback):
+    """
+    Callback to synchronize the model with a reference model.
+    """
+
     def __init__(
         self,
         ref_model: Union[PreTrainedModel, torch.nn.Module],
@@ -106,6 +112,8 @@ class SyncRefModelCallback(TrainerCallback):
     def sync_target_model(model, target_model, alpha):
         deepspeed_plugin = AcceleratorState().deepspeed_plugin
         if deepspeed_plugin is not None and deepspeed_plugin.zero_stage == 3:
+            import deepspeed
+
             with deepspeed.zero.GatheredParameters(
                 list(model.parameters()) + list(target_model.parameters()), modifier_rank=0
             ):
@@ -129,6 +137,9 @@ class RichProgressCallback(TrainerCallback):
     """
 
     def __init__(self):
+        if not is_rich_available():
+            raise ImportError("RichProgressCallback requires the `rich` extra. To install, run `pip install rich`.")
+
         self.training_bar = None
         self.prediction_bar = None
 
@@ -201,7 +212,7 @@ class RichProgressCallback(TrainerCallback):
 
 
 def _win_rate_completions_df(
-    state: TrainerState, prompts: List[str], completions: List[str], winner_indices: List[str]
+    state: TrainerState, prompts: list[str], completions: list[str], winner_indices: list[str]
 ) -> pd.DataFrame:
     global_step = [str(state.global_step)] * len(prompts)
     data = list(zip(global_step, prompts, completions, winner_indices))
@@ -406,9 +417,9 @@ class WinRateCallback(TrainerCallback):
                 )
 
 
-class LogCompletionsCallback(WandbCallback):
+class LogCompletionsCallback(TrainerCallback):
     r"""
-    A [`~transformers.TrainerCallback`] that logs completions to Weights & Biases.
+    A [`~transformers.TrainerCallback`] that logs completions to Weights & Biases and/or Comet.
 
     Usage:
     ```python
@@ -436,7 +447,6 @@ class LogCompletionsCallback(WandbCallback):
         num_prompts: Optional[int] = None,
         freq: Optional[int] = None,
     ):
-        super().__init__()
         self.trainer = trainer
         self.generation_config = generation_config
         self.freq = freq
@@ -483,8 +493,16 @@ class LogCompletionsCallback(WandbCallback):
             global_step = [str(state.global_step)] * len(prompts)
             data = list(zip(global_step, prompts, completions))
             self.table.extend(data)
-            table = self._wandb.Table(columns=["step", "prompt", "completion"], data=self.table)
-            self._wandb.log({"completions": table})
+            table = pd.DataFrame(columns=["step", "prompt", "completion"], data=self.table)
+
+            if "wandb" in args.report_to:
+                wandb.log({"completions": table})
+
+            if "comet_ml" in args.report_to:
+                log_table_to_comet_experiment(
+                    name="completions.csv",
+                    table=table,
+                )
 
         # Save the last logged step, so we don't log the same completions multiple times
         self._last_logged_step = state.global_step
@@ -505,7 +523,7 @@ class MergeModelCallback(TrainerCallback):
     Example:
 
     ```python
-    !pip install trl[mergekit]
+    !pip install mergekit
 
     from trl.mergekit_utils import MergeConfig
     from trl import MergeModelCallback
@@ -524,7 +542,7 @@ class MergeModelCallback(TrainerCallback):
     ):
         if not is_mergekit_available():
             raise ImportError(
-                "MergeModelCallback requires the `mergekit` extra. To install, run `pip install trl[mergekit]`."
+                "MergeModelCallback requires the `mergekit` extra. To install, run `pip install mergekit`."
             )
         self.merge_config = merge_config or MergeConfig()
         self.merge_at_every_checkpoint = merge_at_every_checkpoint

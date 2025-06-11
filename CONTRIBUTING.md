@@ -23,7 +23,7 @@ There are several ways you can contribute to TRL:
 * Contribute to the examples or the documentation.
 
 If you don't know where to start, there is a special [Good First
-Issue](https://github.com/huggingface/trl/contribute) listing. It will give you a list of
+Issue](https://github.com/huggingface/trl/labels/%F0%9F%91%B6%20good%20first%20issue) listing. It will give you a list of
 open issues that are beginner-friendly and help you start contributing to open-source. The best way to do that is to open a Pull Request and link it to the issue that you'd like to work on. We try to give priority to opened PRs as we can easily track the progress of the fix, and if the contributor does not have time anymore, someone else can take the PR over.
 
 For something slightly more challenging, you can also take a look at the [Good Second Issue](https://github.com/huggingface/trl/labels/Good%20Second%20Issue) list. In general though, if you feel like you know what you're doing, go for it and we'll help you get there! 🚀
@@ -38,7 +38,7 @@ pip install -e .[dev]
 
 ## Fixing outstanding issues
 
-If you notice an issue with the existing code and have a fix in mind, feel free to [start contributing](#create-a-pull-request) and open a Pull Request!
+If you notice an issue with the existing code and have a fix in mind, feel free to [start contributing](#submitting-a-pull-request-pr) and open a Pull Request!
 
 ## Submitting a bug-related issue or feature request
 
@@ -171,8 +171,7 @@ Follow these steps to start contributing:
    $ pytest tests/<TEST_TO_RUN>.py
    ```
    
-   > For the following commands leveraging the `make` utility, we recommend using the WSL system when running on
-   > Windows. More information [here](https://docs.microsoft.com/en-us/windows/wsl/about).
+   > For the following commands leveraging the `make` utility.
 
    You can also run the full suite with the following command.
 
@@ -257,7 +256,128 @@ That's how `make test` is implemented (without the `pip install` line)!
 You can specify a smaller set of tests to test only the feature
 you're working on.
 
-### Deprecation and Backward Compatibility
+### Default values guidelines
+
+1. **Use defaults when appropriate**:  
+
+Provide default values unless the parameter's value varies significantly by use case. For example, datasets or models should not have defaults, but parameters like `learning_rate` should.
+
+2. **Prioritize proven defaults**:  
+
+Default values should align with those recommended in the original paper or method. Alternatives require strong evidence of superior performance in most cases.
+
+3. **Ensure safety and predictability**:  
+
+Defaults must be safe, expected and reliable. Avoid settings that could lead to surprising outcomes, such as excessive memory usage or poor performance in edge cases.
+
+4. **Balance consistency and flexibility**:  
+
+Aim for consistent defaults across similar functions or methods. However, consistency should not be preferred to point 2 or 3.
+
+5. **Opt-in for new features**:  
+
+Do not enable new features or improvements (e.g., novel loss functions) by default. Users should explicitly opt-in to use these.
+
+### Writing documentation
+
+High-quality documentation is crucial for maintaining a project that is easy to use, understand, and extend. When adding new features, ensure they are thoroughly documented to maintain consistency and clarity throughout the project.
+
+To illustrate what good documentation looks like, here’s an example of a well-documented function:
+
+````python
+def replicate_str(string: str, n: int, sep: str = " ") -> str:
+    r"""
+    Replicate a string `n` times with a separator.
+
+    Args:
+        string (`str`):
+            String to replicate.
+        n (`int`):
+            Number of times to replicate the string.
+        sep (`str`, *optional*, defaults to `" "`):
+            Separator to use between each replication.
+    
+    Returns:
+        `str`: The replicated string.
+    
+    Examples:
+    ```python
+    >>> replicate_str("hello", 3)
+    "hello hello hello"
+    >>> replicate_str("hello", 3, sep=", ")
+    "hello, hello, hello"
+    ```
+    """
+    return sep.join([string] * n)
+````
+
+* **Line Wrapping:** Applied a consistent line wrap at column 120 to improve readability.
+* **Definite Articles:** Removed definite articles where possible to streamline language. (Eg: Changed "The string to replicate" to "String to replicate")
+* **Type Annotations:**
+  * Always include type definitions, indicating if a parameter is optional and specifying the default value.
+  * Note that `Optional` means that the value can be `None`, and `*optional*` means that it is not required for the user to pass a value.
+    E.g., for arguments that can't be `None` and aren't required:
+
+    ```python
+    foo (`int`, *optional*, defaults to `4`):
+    ```
+
+    For arguments that can be `None` and are required:
+
+    ```python
+    foo (`Optional[int]`):
+    ```
+
+    for arguments that can be `None` and aren't required:
+
+    ```python
+    foo (`Optional[int]`, *optional*, defaults to `None`):
+    ```
+
+* **String Defaults:**
+  * Ensured that default string values are wrapped in double quotes:
+
+    ```python
+    defaults to `"foo"`
+    ```
+
+* **Dictionary Typing:**
+  * Replaced generic `dict` type hints with more explicit `dict[str, Any]` to clarify expected key-value pairs.
+* **Default Value Formatting:**
+  * Consistently surrounded default values with backticks for improved formatting:
+
+    ```python
+    defaults to `4`
+    ```
+
+* **Sub-sectioning:** When the number of arguments is large, consider breaking them into sub-sections for better readability.
+
+    ```python
+    def calculate_statistics(data: list[float], precision: int = 2, include_variance: bool = False) -> dict[str, float]:
+        r"""
+        Calculates basic statistics for a given dataset.
+    
+        Args:
+            > Data inputs
+    
+            data (`list[float]`):
+                A list of numerical values to analyze.
+    
+            > Configuration parameters
+    
+            precision (`int`, *optional*, defaults to `2`):
+                Number of decimal places to round the results.
+            include_variance (`bool`, *optional*, defaults to `False`):
+                Whether to include the variance of the dataset in the results.
+    
+        Returns:
+            `dict[str, float]`:
+                A dictionary containing calculated statistics such as mean, median, and optionally variance.
+        """
+        ...
+      ```
+
+### Deprecation and backward compatibility
 
 Our approach to deprecation and backward compatibility is flexible and based on the feature’s usage and impact. Each deprecation is carefully evaluated, aiming to balance innovation with user needs.
 
@@ -336,3 +456,312 @@ Warnings play a critical role in guiding users toward resolving potential issues
    ```
 
 By following this classification, you ensure that warnings, information, and exceptions are used appropriately, providing clear guidance to the user without cluttering the system with unnecessary messages.
+
+
+## Making a release
+
+> [!NOTE]
+> VERSION needs to be formatted following the `v{major}.{minor}.{patch}` convention. We need to follow this convention to be able to retrieve versioned scripts.
+
+#### 0. Prerequisites
+
+- Dependencies:
+   - twine: `pip install build twine`
+- Create an account in (and join the `trl` project):
+   - PyPI: https://pypi.org/
+   - Test PyPI: https://test.pypi.org/
+
+### Major/Minor Release
+
+#### 1. Ensure your local repository is up to date with the upstream repository
+
+```bash
+git checkout main
+git pull origin main
+```
+
+> [!WARNING]
+> Do not merge other pull requests into `main` until the release is done. This is to ensure that the release is stable and does not include any untested changes. Announce internally (#trl-internal) to other maintainers that you are doing a release and that they must not merge PRs until the release is done.
+
+#### 2. Create a release branch from main
+
+```bash
+git checkout -b release-v{major}.{minor}
+```
+
+#### 3. Change the version in the following files
+
+- `.github/workflows/tests_latest.yml`:
+  ```diff
+  - with: { ref: v{major}.{minor-1}-release }
+  + with: { ref: v{major}.{minor}-release }
+  ```
+- `CITATION.cff`
+  ```diff
+  - version: {major}.{minor-1}
+  + version: {major}.{minor}
+  ```    
+- `trl/__init__.py`
+  ```diff
+  - __version__ = "{major}.{minor}.0.dev0"
+  + __version__ = "{major}.{minor}.0"
+  ```
+- `setup.cfg`
+  ```diff
+  - version = {major}.{minor}.0.dev0
+  + version = {major}.{minor}.0
+  ```
+
+#### 4. Commit and push these changes
+
+```shell
+git add .github/workflows/tests_latest.yml CITATION.cff trl/__init__.py setup.cfg
+git commit -m 'Release: {major}.{minor}'
+git push origin release-v{major}.{minor}
+```
+
+#### 5. Create a pull request 
+
+from `release-v{major}.{minor}` to `main`, named `Release: v{major}.{minor}`, wait for tests to pass, and request a review.
+
+#### 6. Once the pull request is approved, merge it into `main`
+
+#### 7. Add a tag in git to mark the release
+
+```shell
+git checkout main
+git pull origin main
+git tag -a v{major}.{minor}.0 -m 'Adds tag v{major}.{minor}.0 for PyPI'
+git push origin v{major}.{minor}.0
+```
+
+#### 8. Create a branch `v{major}.{minor}-release` for future patch releases.
+
+```shell
+git checkout -b v{major}.{minor}-release
+git push origin v{major}.{minor}-release
+```
+
+This ensures that future patch releases (`v{major}.{minor}.1`, `v{major}.{minor}.2`, etc.) can be made separately from `main`.
+
+#### 9. Create the wheels for your release
+
+These are the artifacts that will be uploaded to PyPI and installed by users via `pip install trl`.
+
+Clean previous builds:
+
+```shell
+rm -rf build dist
+```
+
+At the root of your repo, run
+
+```bash
+python -m build .
+```
+
+This will create a folders named `dist` with the new versions of your package.
+
+#### 10. Upload the package to PyPI Test
+
+> [!IMPORTANT]
+> Do not skip this step. It is important to test the package before uploading it to the main PyPI server.
+
+```shell
+twine upload dist/* -r testpypi
+```
+
+Then in a fresh environment containing all dependencies you need, try to install your new package from the PyPI test server.
+
+```bash
+pip install -i https://test.pypi.org/simple/ trl
+```
+
+You might get errors for missing dependencies since the PyPI test server does not contain all packages like PyPI does. To make sure you have everything you can do:
+
+```bash
+pip install trl
+pip uninstall trl
+```
+
+(the second line will remove trl but keep all its dependencies).
+
+Also make sure you can actually use the package! Run the following line:
+
+```bash
+python -c "from trl import *"
+```
+
+along with anything that tests:
+
+- the core feature of your package
+- the new features you’re adding in the release
+
+#### 11. Publish on PyPI
+
+> [!WARNING]
+> This can't be reverted. Make sure you have tested everything before doing this step.
+
+```shell
+twine upload dist/*
+```
+
+#### 12. Create a GitHub Release
+
+1. Go to the repo’s [releases section](https://github.com/huggingface/trl/releases) on GitHub.
+2. Click **Draft a new release**.
+3. Select the `v{major}.{minor}.0` tag you just created in step 7.
+4. Add a title (`v{major}.{minor}.0`) and a short description of what’s new.
+5. Click **Publish Release**.
+
+#### 13. Bump to dev version
+
+1. Create a branch `bump-dev-version-{major}.{minor+1}` from `main` and checkout to it.
+
+   ```shell
+   git checkout -b bump-dev-version-{major}.{minor+1}
+   ```
+
+2. Change the version in the following files:
+   1. `trl/__init__.py`
+      ```diff
+      - __version__ = "{major}.{minor}.0"
+      + __version__ = "{major}.{minor+1}.0.dev0"
+      ```
+   2. `setup.cfg`
+      ```diff
+      - version = {major}.{minor}.0
+      + version = {major}.{minor+1}.0.dev0
+      ```
+
+3. Commit and push these changes
+
+   ```shell
+   git add trl/__init__.py setup.cfg
+   git commit -m '⬆️ Bump dev version'
+   git push origin bump-dev-version-{major}.{minor+1}
+   ```
+
+4. Create a pull request from `bump-dev-version-{major}.{minor+1}` to `main`, named `⬆️ Bump dev version`, and request urgent review.
+
+5. Once the pull request is approved, merge it into `main`.
+
+6. The codebase is now ready for the next development cycle, inform the team in the #trl-internal channel.
+
+
+## Making a patch release
+
+#### 1. Ensure your local repository is up to date with the upstream repository
+
+```bash
+git checkout v{major}.{minor}-release
+git pull origin main
+```
+
+#### 2. Cherry-pick the changes you want to include in the patch release
+
+```bash
+git cherry-pick <commit-hash-0>
+git cherry-pick <commit-hash-1>
+...
+```
+
+#### 3. Change the version in the following files
+
+- `trl/__init__.py`
+  ```diff
+  - __version__ = "{major}.{minor}.{patch-1}"
+  + __version__ = "{major}.{minor}.{patch}"
+  ```
+- `setup.cfg`
+  ```diff
+  - version = {major}.{minor}.{patch-1}
+  + version = {major}.{minor}.{patch}
+  ```
+
+#### 4. Commit and push these changes
+
+```shell
+git add trl/__init__.py setup.cfg
+git commit -m 'Release: {major}.{minor}.{patch}'
+git push origin v{major}.{minor}-release
+```
+
+#### 5. Wait for the CI to pass
+
+#### 6. Add a tag in git to mark the release
+
+```shell
+git tag -a v{major}.{minor}.{patch} -m 'Adds tag v{major}.{minor}.{patch} for PyPI'
+git push origin v{major}.{minor}.{patch}
+```
+
+#### 7. Create the wheels for your release
+
+These are the artifacts that will be uploaded to PyPI and installed by users via `pip install trl`.
+
+Clean previous builds:
+
+```shell
+rm -rf build dist
+```
+
+At the root of your repo, run
+
+```bash
+python -m build .
+```
+
+This will create a folders named `dist` with the new versions of your package.
+
+#### 8. Upload the package to PyPI Test
+
+> [!IMPORTANT]
+> Do not skip this step. It is important to test the package before uploading it to the main PyPI server.
+
+```shell
+twine upload dist/* -r testpypi
+```
+
+Then in a fresh environment containing all dependencies you need, try to install your new package from the PyPI test server.
+
+```bash
+pip install -i https://test.pypi.org/simple/ trl
+```
+
+You might get errors for missing dependencies since the PyPI test server does not contain all packages like PyPI does. To make sure you have everything you can do:
+
+```bash
+pip install trl
+pip uninstall trl
+```
+
+(the second line will remove trl but keep all its dependencies).
+
+Also make sure you can actually use the package! Run the following line:
+
+```bash
+python -c "from trl import *"
+```
+
+along with anything that tests:
+
+- the core feature of your package
+- the new features you’re adding in the release
+
+#### 9. Publish on PyPI
+
+> [!WARNING]
+> This can't be reverted. Make sure you have tested everything before doing this step.
+
+```shell
+twine upload dist/*
+```
+
+#### 10. Create a GitHub Release
+
+1. Go to the repo’s [releases section](https://github.com/huggingface/trl/releases) on GitHub.
+2. Click **Draft a new release**.
+3. Select the `v{major}.{minor}.{patch}` tag you just created in step 7.
+4. Add a title (`v{major}.{minor}.{patch}`) and a short description of what’s new.
+5. Click **Publish Release**.

@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -29,6 +29,8 @@ from transformers import (
     CohereForCausalLM,
     DbrxConfig,
     DbrxForCausalLM,
+    DeepseekV3Config,
+    DeepseekV3ForCausalLM,
     FalconMambaConfig,
     FalconMambaForCausalLM,
     Gemma2Config,
@@ -43,6 +45,7 @@ from transformers import (
     Idefics2ForConditionalGeneration,
     LlamaConfig,
     LlamaForCausalLM,
+    LlamaForSequenceClassification,
     LlavaConfig,
     LlavaForConditionalGeneration,
     LlavaNextConfig,
@@ -57,6 +60,10 @@ from transformers import (
     Phi3ForCausalLM,
     Qwen2Config,
     Qwen2ForCausalLM,
+    Qwen2ForSequenceClassification,
+    Qwen3Config,
+    Qwen3ForCausalLM,
+    Qwen3ForSequenceClassification,
     SiglipVisionConfig,
     T5Config,
     T5ForConditionalGeneration,
@@ -81,11 +88,13 @@ This is a minimal model built for unit tests in the [TRL](https://github.com/hug
 api = HfApi()
 
 
-def push_to_hub(model, tokenizer, suffix=None):
+def push_to_hub(model, tokenizer, prefix=None, suffix=None):
     model_class_name = model.__class__.__name__
     content = MODEL_CARD.format(model_class_name=model_class_name)
     model_card = ModelCard(content)
-    repo_id = f"{ORGANIZATION}/tiny-{model_class_name}"
+    if prefix is not None:
+        model_class_name = f"{prefix}-{model_class_name}"
+    repo_id = f"{ORGANIZATION}/{model_class_name}"
     if suffix is not None:
         repo_id += f"-{suffix}"
 
@@ -102,6 +111,9 @@ for model_id, config_class, model_class, suffix in [
     ("bigscience/bloomz-560m", BloomConfig, BloomForCausalLM, None),
     ("CohereForAI/aya-expanse-8b", CohereConfig, CohereForCausalLM, None),
     ("databricks/dbrx-instruct", DbrxConfig, DbrxForCausalLM, None),
+    ("deepseek-ai/DeepSeek-R1", DeepseekV3Config, DeepseekV3ForCausalLM, None),
+    # It's important to have R1-0528 as it doesn't have the same chat template
+    ("deepseek-ai/DeepSeek-R1-0528", DeepseekV3Config, DeepseekV3ForCausalLM, "0528"),
     ("tiiuae/falcon-7b-instruct", FalconMambaConfig, FalconMambaForCausalLM, None),
     ("google/gemma-2-2b-it", Gemma2Config, Gemma2ForCausalLM, None),
     ("google/gemma-7b-it", GemmaConfig, GemmaForCausalLM, None),
@@ -116,6 +128,7 @@ for model_id, config_class, model_class, suffix in [
     ("microsoft/Phi-3.5-mini-instruct", Phi3Config, Phi3ForCausalLM, None),
     ("Qwen/Qwen2.5-32B-Instruct", Qwen2Config, Qwen2ForCausalLM, "2.5"),
     ("Qwen/Qwen2.5-Coder-0.5B", Qwen2Config, Qwen2ForCausalLM, "2.5-Coder"),
+    ("Qwen/Qwen3-4B", Qwen3Config, Qwen3ForCausalLM, None),
 ]:
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     config = config_class(
@@ -127,7 +140,52 @@ for model_id, config_class, model_class, suffix in [
         intermediate_size=32,
     )
     model = model_class(config)
-    push_to_hub(model, tokenizer, suffix)
+    push_to_hub(model, tokenizer, "tiny", suffix)
+
+
+# Two slightly bigger models, required for vLLM testing
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-32B-Instruct")
+config = Qwen2Config(
+    vocab_size=tokenizer.vocab_size + len(tokenizer.added_tokens_encoder.keys()),
+    hidden_size=128,  # increase hidden size so that hidden_size // num_attention_heads = 32, required for vLLM
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    num_hidden_layers=2,
+    intermediate_size=32,
+)
+model = Qwen2ForCausalLM(config)
+push_to_hub(model, tokenizer, "small", "2.5")
+
+tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-4B")
+config = Qwen3Config(
+    vocab_size=tokenizer.vocab_size + len(tokenizer.added_tokens_encoder.keys()),
+    hidden_size=128,  # increase hidden size so that hidden_size // num_attention_heads = 32, required for vLLM
+    num_attention_heads=4,
+    num_key_value_heads=2,
+    num_hidden_layers=2,
+    intermediate_size=32,
+)
+model = Qwen3ForCausalLM(config)
+push_to_hub(model, tokenizer, "small")
+
+# Reward models
+for model_id, config_class, model_class, suffix in [
+    ("meta-llama/Llama-3.2-1B-Instruct", LlamaConfig, LlamaForSequenceClassification, "3.2"),
+    ("Qwen/Qwen2.5-32B-Instruct", Qwen2Config, Qwen2ForSequenceClassification, "2.5"),
+    ("Qwen/Qwen3-4B", Qwen3Config, Qwen3ForSequenceClassification, None),
+]:
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    config = config_class(
+        vocab_size=tokenizer.vocab_size + len(tokenizer.added_tokens_encoder.keys()),
+        hidden_size=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        intermediate_size=32,
+        num_labels=1,
+    )
+    model = model_class(config)
+    push_to_hub(model, tokenizer, "tiny", suffix)
 
 
 # Encoder-decoder models
@@ -149,7 +207,7 @@ for model_id, config_class, model_class, suffix in [
         is_encoder_decoder=True,
     )
     model = model_class(config)
-    push_to_hub(model, tokenizer, suffix)
+    push_to_hub(model, tokenizer, "tiny", suffix)
 
 
 # Vision Language Models
@@ -190,4 +248,4 @@ for model_id, config_class, text_config_class, vision_config_class, model_class 
         **kwargs,
     )
     model = model_class(config)
-    push_to_hub(model, processor)
+    push_to_hub(model, processor, "tiny")

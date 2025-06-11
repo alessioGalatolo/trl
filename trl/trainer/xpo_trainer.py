@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ from transformers import (
 )
 from transformers.trainer_utils import EvalPrediction
 from transformers.training_args import OptimizerNames
+from transformers.utils import is_peft_available
 
 from ..data_utils import is_conversational, maybe_apply_chat_template
 from ..models.utils import unwrap_model_for_generation
@@ -44,6 +45,7 @@ from .utils import (
     generate_model_card,
     get_comet_experiment_url,
     get_reward,
+    selective_log_softmax,
     truncate_right,
 )
 from .xpo_config import XPOConfig
@@ -55,6 +57,10 @@ if is_apex_available():
 
 if is_wandb_available():
     import wandb
+
+
+if is_peft_available():
+    from peft import PeftModel
 
 
 class XPOTrainer(OnlineDPOTrainer):
@@ -173,16 +179,26 @@ class XPOTrainer(OnlineDPOTrainer):
             return self._alpha
 
     def _generate_completions(self, prompts, model):
-        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-            model_output = unwrapped_model.generate(
+        with unwrap_model_for_generation(model, self.accelerator) as unwrapped_policy_model_for_gen:
+            model_output = unwrapped_policy_model_for_gen.generate(
                 input_ids=prompts["input_ids"],
                 attention_mask=prompts["attention_mask"],
                 generation_config=self.generation_config,
             )
 
-        ref_model = model if self.ref_model is None else self.ref_model
-        with torch.no_grad(), unwrap_model_for_generation(ref_model, self.accelerator) as unwrapped_ref_model:
-            ref_output = unwrapped_ref_model.generate(
+        actual_model_for_ref_generation: torch.nn.Module
+        if self.ref_model is None:
+            unwrapped_main_model_for_ref_logic = self.accelerator.unwrap_model(model)
+
+            if is_peft_available() and isinstance(unwrapped_main_model_for_ref_logic, PeftModel):
+                actual_model_for_ref_generation = unwrapped_main_model_for_ref_logic.get_base_model()
+            else:
+                actual_model_for_ref_generation = unwrapped_main_model_for_ref_logic
+        else:
+            actual_model_for_ref_generation = self.accelerator.unwrap_model(self.ref_model)
+
+        with unwrap_model_for_generation(actual_model_for_ref_generation, self.accelerator) as final_ref_model_for_gen:
+            ref_output = final_ref_model_for_gen.generate(
                 input_ids=prompts["input_ids"],
                 attention_mask=prompts["attention_mask"],
                 generation_config=self.generation_config,
@@ -274,8 +290,7 @@ class XPOTrainer(OnlineDPOTrainer):
         def compute_logprobs_for_data(m, data):
             output = m(data["input_ids"], attention_mask=data["attention_mask"])
             logits = output.logits[:, context_length - 1 : -1]
-            logprobs = F.log_softmax(logits, dim=-1)
-            token_logprobs = torch.gather(logprobs, 2, data["input_ids"][:, context_length:].unsqueeze(-1)).squeeze(-1)
+            token_logprobs = selective_log_softmax(logits, data["input_ids"][:, context_length:])
             return token_logprobs
 
         # Compute logprobs for model completions
@@ -360,7 +375,7 @@ class XPOTrainer(OnlineDPOTrainer):
     ):
         # Helper function to gather and compute mean
         def gather_mean(tensor):
-            return self.accelerator.gather(tensor).mean().item()
+            return self.accelerator.gather_for_metrics(tensor).mean().item()
 
         # Log losses
         self.stats["loss/dpo"].append(gather_mean(dpo_losses))
@@ -525,10 +540,10 @@ class XPOTrainer(OnlineDPOTrainer):
         Creates a draft of a model card using the information available to the `Trainer`.
 
         Args:
-            model_name (`str`, *optional*, defaults to `None`):
-                The name of the model.
-            dataset_name (`str`, *optional*, defaults to `None`):
-                The name of the dataset used for training.
+            model_name (`str` or `None`, *optional*, defaults to `None`):
+                Name of the model.
+            dataset_name (`str` or `None`, *optional*, defaults to `None`):
+                Name of the dataset used for training.
             tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
                 Tags to be associated with the model card.
         """

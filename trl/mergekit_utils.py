@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -59,22 +59,20 @@ class MergeConfig:
 
     Attributes:
         method (`str`): The merge method to use.
-        policy_model_path (`Optional[str]`): Path to the policy model.
-        target_model_path (`Optional[str]`): Path to the target model.
+        policy_model_path (`str` or `None`): Path to the policy model.
+        target_model_path (`str` or `None`): Path to the target model.
         policy_model_weight (`float`): Weight for the policy model (for `linear` and `ties` methods).
         target_model_weight (`float`): Weight for the target model (for `linear` and `ties` methods).
         policy_model_density (`list[float]`): Density parameters for the policy model (for `ties` and `dare_ties`).
         target_model_density (`list[float]`): Density parameters for the target model (for `ties` and `dare_ties`).
-        normalize (`Optional[float]`): Normalization factor for the TIES method.
-        t_values (`Optional[float]`): Interpolation factor for the SLERP method.
+        normalize (`float` or `None`): Normalization factor for the TIES method.
+        t_values (`float` or `None`): Interpolation factor for the SLERP method.
         dtype (`str`): Data type to use for merging, e.g., `"float16"`.
     """
 
     def __init__(self, method: str = "linear"):
         if not is_mergekit_available():
-            raise ImportError(
-                "MergeConfig requires the `mergekit` extra. To install, run `pip install trl[mergekit]`."
-            )
+            raise ImportError("MergeConfig requires the `mergekit` extra. To install, run `pip install mergekit`.")
         self.method = method
         self.policy_model_path = None
         self.target_model_path = None
@@ -270,7 +268,7 @@ def merge_models(config: MergeConfig, out_path: str):
         out_path (`str`): The output path for the merged model.
     """
     if not is_mergekit_available():
-        raise ImportError("merge_models requires the `mergekit` extra. To install, run `pip install trl[mergekit]`.")
+        raise ImportError("merge_models requires the `mergekit` extra. To install, run `pip install mergekit`.")
     run_merge(
         config,
         out_path=out_path,

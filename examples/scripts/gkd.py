@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,7 +45,6 @@ python examples/scripts/gkd.py \
     --lora_alpha 16
 """
 
-from accelerate import PartialState
 from datasets import load_dataset
 from transformers import AutoTokenizer, GenerationConfig
 
@@ -105,14 +104,6 @@ if __name__ == "__main__":
     # Dataset
     ################
     dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
-
-    with PartialState().local_main_process_first():
-        dataset = dataset.map(
-            lambda x: {
-                "prompt": tokenizer.apply_chat_template(x["prompt"], tokenize=False, add_generation_prompt=True)
-            },
-            num_proc=training_args.dataset_num_proc,
-        )
 
     ################
     # Training

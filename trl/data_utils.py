@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,10 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, Optional, Sequence, TypeVar, Union
+import warnings
+from collections import defaultdict, deque
+from collections.abc import Sequence
+from itertools import takewhile
+from typing import Any, Callable, Optional, TypeVar, Union
 
+import numpy as np
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.types
 from datasets import Dataset, DatasetDict
-from transformers import PreTrainedTokenizer
+from transformers import PreTrainedTokenizerBase
 
 
 DatasetType = TypeVar("DatasetType", Dataset, DatasetDict)
@@ -31,7 +39,8 @@ def is_conversational(example: dict[str, Any]) -> bool:
             dataset type.
 
     Returns:
-        `bool`: `True` if the data is in a conversational format, `False` otherwise.
+        `bool`:
+            `True` if the data is in a conversational format, `False` otherwise.
 
     Examples:
 
@@ -63,7 +72,7 @@ def is_conversational(example: dict[str, Any]) -> bool:
 
 def apply_chat_template(
     example: dict[str, list[dict[str, str]]],
-    tokenizer: PreTrainedTokenizer,
+    tokenizer: PreTrainedTokenizerBase,
     tools: Optional[list[Union[dict, Callable]]] = None,
 ) -> dict[str, str]:
     r"""
@@ -90,8 +99,21 @@ def apply_chat_template(
 
     # Apply the chat template to the prompt, adding the generation prompt
     if "prompt" in example:
+        last_role = example["prompt"][-1]["role"]
+        if last_role == "user":
+            add_generation_prompt = True
+            continue_final_message = False
+        elif last_role == "assistant":
+            add_generation_prompt = False
+            continue_final_message = True
+        else:
+            raise ValueError(f"Invalid role in the last message: {last_role}")
         prompt = tokenizer.apply_chat_template(
-            example["prompt"], tools=tools, tokenize=False, add_generation_prompt=True
+            example["prompt"],
+            tools=tools,
+            continue_final_message=continue_final_message,
+            tokenize=False,
+            add_generation_prompt=add_generation_prompt,
         )
 
     # Apply the chat template to the entire prompt + completion
@@ -100,36 +122,31 @@ def apply_chat_template(
             prompt_chosen = tokenizer.apply_chat_template(
                 example["prompt"] + example["chosen"], tools=tools, tokenize=False
             )
+            # DeepSeek-R1 inserts a <think> token when using `add_generation_prompt`, which can cause discrepancies
+            # between the prompt alone and the combined prompt+completion. To ensure consistency, we extract the
+            # common prefix between the two. In most cases, this is a no-op.
+            prompt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(prompt, prompt_chosen)))
+
             chosen = prompt_chosen[len(prompt) :]
         if "rejected" in example and "prompt" in example:  # explicit prompt
             prompt_rejected = tokenizer.apply_chat_template(
                 example["prompt"] + example["rejected"], tools=tools, tokenize=False
             )
+            # Handle DeepSeek-R1 <think> token, see the above comment for details
+            prompt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(prompt, prompt_rejected)))
             rejected = prompt_rejected[len(prompt) :]
         if "completion" in example:
             prompt_completion = tokenizer.apply_chat_template(
                 example["prompt"] + example["completion"], tools=tools, tokenize=False
             )
+            # Handle DeepSeek-R1 <think> token, see the above comment for details
+            prompt = "".join(x for x, _ in takewhile(lambda x: x[0] == x[1], zip(prompt, prompt_completion)))
             completion = prompt_completion[len(prompt) :]
     else:  # implicit prompt case
         if "chosen" in example:
             chosen = tokenizer.apply_chat_template(example["chosen"], tools=tools, tokenize=False)
         if "rejected" in example:
             rejected = tokenizer.apply_chat_template(example["rejected"], tools=tools, tokenize=False)
-
-    # Ensure that the prompt is the initial part of the prompt-completion string
-    if "prompt" in example:
-        error_message = (
-            "The chat template applied to the prompt + completion does not start with the chat template applied to "
-            "the prompt alone. This can indicate that the chat template is not supported by TRL."
-            "\n**Prompt**:\n{}\n\n**Prompt + Completion**:\n{}"
-        )
-        if "chosen" in example and not prompt_chosen.startswith(prompt):
-            raise ValueError(error_message.format(prompt, prompt_chosen))
-        if "rejected" in example and not prompt_rejected.startswith(prompt):
-            raise ValueError(error_message.format(prompt, prompt_rejected))
-        if "completion" in example and not prompt_completion.startswith(prompt):
-            raise ValueError(error_message.format(prompt, prompt_completion))
 
     # Extract the completion by removing the prompt part from the prompt-completion string
     output = {}
@@ -151,7 +168,7 @@ def apply_chat_template(
 
 def maybe_apply_chat_template(
     example: dict[str, list[dict[str, str]]],
-    tokenizer: PreTrainedTokenizer,
+    tokenizer: PreTrainedTokenizerBase,
     tools: Optional[list[Union[dict, Callable]]] = None,
 ) -> dict[str, str]:
     r"""
@@ -171,18 +188,22 @@ def maybe_apply_chat_template(
 
             For keys `"messages"`, `"prompt"`, `"chosen"`, `"rejected"`, and `"completion"`, the values are lists of
             messages, where each message is a dictionary with keys `"role"` and `"content"`.
-        tokenizer (`PreTrainedTokenizer`):
-            The tokenizer to apply the chat template with.
-        tools (`Optional[list[Union[dict, Callable]]]`, *optional*, defaults to `None`):
+        tokenizer (`PreTrainedTokenizerBase`):
+            Tokenizer to apply the chat template with.
+        tools (`list[Union[dict, Callable]]` or `None`, *optional*, defaults to `None`):
             A list of tools (callable functions) that will be accessible to the model.
             If the template does not support function calling, this argument will have no effect
 
     Returns:
-        `dict[str, str]`: The formatted example with the chat template applied.
+        `dict[str, str]`:
+            Formatted example with the chat template applied.
 
-    Note:
-        This function does not alter the keys, except for Language modeling dataset, where `"messages"` is replaced by
-        `"text"`.
+    Notes:
+        - This function does not alter the keys, except for Language modeling dataset, where `"messages"` is replaced
+        by `"text"`.
+
+        - In case of prompt-only data, if the last role is `"user"`, the generation prompt is added to the prompt.
+        Else, if the last role is `"assistant"`, the final message is continued.
 
     Example:
 
@@ -224,7 +245,7 @@ def unpair_preference_dataset(
         dataset (`Dataset` or `DatasetDict`):
             Preference dataset to unpair. The dataset must have columns `"chosen"`, `"rejected"` and optionally
             `"prompt"`.
-        num_proc (`Optional[int]`, *optional*, defaults to `None`):
+        num_proc (`int` or `None`, *optional*, defaults to `None`):
             Number of processes to use for processing the dataset.
         desc (`str` or `None`, *optional*, defaults to `None`):
             Meaningful description to be displayed alongside with the progress bar while mapping examples.
@@ -265,7 +286,7 @@ def maybe_unpair_preference_dataset(
         dataset (`Dataset` or `DatasetDict`):
             Preference dataset to unpair. The dataset must have columns `"chosen"`, `"rejected"` and optionally
             `"prompt"`.
-        num_proc (`Optional[int]`, *optional*, defaults to `None`):
+        num_proc (`int` or `None`, *optional*, defaults to `None`):
             Number of processes to use for processing the dataset.
         desc (`str` or `None`, *optional*, defaults to `None`):
             Meaningful description to be displayed alongside with the progress bar while mapping examples.
@@ -412,3 +433,333 @@ def maybe_extract_prompt(example: dict[str, list]) -> dict[str, list]:
         if (chosen_conv and prompt_conv) or (not chosen_conv and not prompt_conv):
             return example
     return extract_prompt({"chosen": example["chosen"], "rejected": example["rejected"]})
+
+
+def pack_examples(examples: dict[str, list[list]], seq_length: int) -> dict[str, list[list]]:
+    """
+    Pack examples into chunks of size `seq_length`.
+
+    Args:
+        examples (`dict[str, list[list]]`):
+            Dictionary of examples with keys as strings and values as lists of lists.
+        seq_length (`int`):
+            Maximum sequence length.
+
+    Returns:
+        `dict[str, list[list]]`: Dictionary of examples with keys as strings and values as lists of lists.
+
+    Example:
+
+    ```python
+    >>> from trl import pack_examples
+    >>> examples = {
+    ...     "input_ids": [[1, 2, 3], [4, 5, 6, 7], [8]],
+    ...     "attention_mask": [[0, 1, 1], [0, 0, 1, 1], [1]],
+    ... }
+    >>> pack_examples(examples, seq_length=5)
+    {'input_ids': [[1, 2, 3, 4, 5], [6, 7, 8]], 'attention_mask': [[0, 1, 1, 0, 0], [1, 1, 1]]}
+    >>> pack_examples(examples, seq_length=2)
+    {'input_ids': [[1, 2], [3, 4], [5, 6], [7, 8]], 'attention_mask': [[0, 1], [1, 0], [0, 1], [1, 1]]}
+    ```
+    """
+    warnings.warn(
+        "`pack_examples` is deprecated and will be removed in version 0.20.0. Use `pack_dataset` with a dataset "
+        "instead.",
+        DeprecationWarning,
+    )
+    # Join  all the values into a single list
+    examples = {k: sum(v, []) for k, v in examples.items()}
+    # Split the values into chunks of size seq_length
+    examples = {k: [v[i : i + seq_length] for i in range(0, len(v), seq_length)] for k, v in examples.items()}
+    return examples
+
+
+class _SegmentTree:
+    """
+    A segment tree data structure that, when initialized as `_SegmentTree(maxval)`, efficiently finds the next larger value
+    for a given input within the range [1, maxval].
+
+    See [Fewer Truncations Improve Language Modeling](https://arxiv.org/abs/2404.10830) for more details.
+    """
+
+    def __init__(self, maxval: int):
+        self.maxval = maxval
+        self.tree = [0] * (2 * maxval)
+
+    def add(self, val):
+        assert 0 < val <= self.maxval
+        i = self.maxval + val - 1
+        self.tree[i] = val
+        while i > 1:
+            i >>= 1
+            left, right = self.tree[i << 1], self.tree[(i << 1) + 1]
+            # Compare the values using if-else otherwise repeated calls to `builtins.max` become the bottleneck
+            self.tree[i] = left if left >= right else right
+
+    def remove(self, val):
+        assert 0 < val <= self.maxval
+        i = self.maxval + val - 1
+        self.tree[i] = 0
+        while i > 1:
+            i >>= 1
+            left, right = self.tree[i << 1], self.tree[(i << 1) + 1]
+            # Compare the values using if-else otherwise repeated calls to `builtins.max` become the bottleneck
+            self.tree[i] = left if left >= right else right
+
+    def search(self, val):
+        assert 0 < val <= self.maxval
+        i = 1
+        while i < self.maxval:
+            if self.tree[i << 1] >= val:
+                i = i << 1
+            else:
+                i = (i << 1) + 1
+        return self.tree[i]
+
+
+def _pack_ffd(examples: pa.Table, seq_length: int) -> pa.Table:
+    """Pack sequences in a pyarrow Table using First Fit Decreasing strategy."""
+    # Add position_ids to the examples
+    input_ids = examples["input_ids"]
+    position_ids_python = [list(range(len(sequence))) for sequence in input_ids.to_pylist()]
+    position_ids_array = pa.array(position_ids_python, type=examples["input_ids"].type)
+    examples = examples.append_column("position_ids", position_ids_array)
+
+    columns = []
+    list_column_idx = None
+    for idx, column in enumerate(examples.columns):
+        if pyarrow.types.is_list(column.type) or pyarrow.types.is_large_list(column.type):
+            column = pc.list_slice(column, 0, seq_length)
+            if list_column_idx is None:
+                list_column_idx = idx
+        columns.append(column)
+    examples = pa.Table.from_arrays(columns, names=examples.column_names)
+
+    ids = np.arange(len(examples))
+    assert list_column_idx is not None
+    lengths = pc.make_struct(pc.list_value_length(examples[list_column_idx]).combine_chunks(), ids)
+    lengths = lengths.sort("descending", by=0)
+
+    segment_tree = _SegmentTree(seq_length)
+    segment_tree.add(seq_length)  # the max, `seq_length` bin is always available
+    space_to_bin = defaultdict(deque)
+
+    # Bin is represented as a dict (of example ids and sum of their lengths) to allow in-place updates
+    bins: list[dict] = []
+    for length, idx in zip(lengths.field(0).to_numpy(), lengths.field(1).to_numpy()):
+        space = segment_tree.search(length)
+
+        if space < seq_length:
+            bin = space_to_bin[space].popleft()
+        else:
+            bin = {"ids": [], "length": 0}
+            bins.append(bin)
+
+        bin["ids"].append(idx)
+        bin["length"] += length
+        if space < seq_length and not space_to_bin[space]:
+            segment_tree.remove(space)
+
+        space = space - length
+        space_to_bin[space].append(bin)
+        if space > 0:
+            segment_tree.add(space)
+
+    examples = pc.take(examples, [id_ for bin in bins for id_ in bin["ids"]])
+    offsets = np.array([0] + [bin["length"] for bin in bins])
+    offsets = np.cumsum(offsets)
+
+    columns = []
+    for column in examples.columns:
+        assert len(column.chunks) == 1  # `pc.take` returns a ChunkedArray with a single chunk
+        column = column.chunks[0]
+        if pa.types.is_list(column.type) or pa.types.is_large_list(column.type):
+            dtype = column.offsets.type.to_pandas_dtype()
+            column = type(column).from_arrays(offsets.astype(dtype), column.values)
+        columns.append(column)
+    return pa.Table.from_arrays(columns, names=examples.column_names)
+
+
+def _pack_wrapped(examples: pa.Table, seq_length: int) -> pa.Table:
+    """Pack sequences in a pyarrow Table using a wrapped strategy."""
+    columns = []
+    for column in examples.columns:
+        if pyarrow.types.is_list(column.type) or pyarrow.types.is_large_list(column.type):
+            if isinstance(column, pa.ChunkedArray):
+                column = column.combine_chunks()
+            offsets, values = column.offsets, column.values
+            values = values[offsets[0].as_py() : offsets[-1].as_py()]
+            num_elements = len(values)
+            dtype = offsets.type.to_pandas_dtype()  # np.int32 or np.int64
+            offsets = np.arange(0, num_elements, seq_length, dtype=dtype)
+            offsets = np.concatenate((offsets, [num_elements]))
+            column = type(column).from_arrays(offsets, values)
+        columns.append(column)
+    return pa.Table.from_arrays(columns, names=examples.column_names)
+
+
+def pack_dataset(
+    dataset: DatasetType, seq_length: int, strategy: str = "ffd", map_kwargs: Optional[dict[str, Any]] = None
+) -> DatasetType:
+    r"""
+    Pack sequences in a dataset into chunks of size `seq_length`.
+
+    Args:
+        dataset (`Dataset` or `DatasetDict`):
+            Dataset to pack
+        seq_length (`int`):
+            Target sequence length to pack to.
+        strategy (`str`, *optional*, defaults to `"ffd"`):
+            Packing strategy to use. Can be either:
+
+            - `"ffd"` (First Fit Decreasing): Slower but preserves sequence boundaries. Sequences are never cut in the
+                middle.
+            - `"wrapped"`: Faster but more aggressive. Ignores sequence boundaries and will cut sequences in the middle
+                to completely fill each packed sequence with data.
+        map_kwargs (`dict` or `None`, *optional*, defaults to `None`):
+            Additional keyword arguments to pass to the dataset's map method when packing examples.
+
+    Returns:
+        `Dataset` or `DatasetDict`: The dataset with packed sequences. The number of examples may
+        decrease as sequences are combined.
+
+    Example:
+    ```python
+    >>> from datasets import Dataset
+    >>> from trl import pack_dataset
+    >>> examples = {
+    ...     "input_ids": [[1, 2, 3], [4, 5], [6, 7, 8], [9]],
+    ...     "attention_mask": [[1, 1, 0], [1, 0], [1, 0, 0], [1]]
+    ... }
+    >>> dataset = Dataset.from_dict(examples)
+    >>> packed_dataset = pack_dataset(dataset, seq_length=4, strategy="ffd")
+    >>> packed_dataset[:]
+    {'input_ids': [[1, 2, 3, 9], [6, 7, 8, 4, 5]],
+     'attention_mask': [[1, 1, 0, 1], [1, 0, 0, 1, 0]]}
+    ```
+    """
+    if map_kwargs is None:
+        map_kwargs = {}
+    # Fast packing with pyarrow
+    dataset = dataset.with_format("arrow")
+    if strategy == "ffd":
+        dataset = dataset.map(_pack_ffd, batched=True, fn_kwargs={"seq_length": seq_length}, **map_kwargs)
+    elif strategy == "wrapped":
+        dataset = dataset.map(_pack_wrapped, batched=True, fn_kwargs={"seq_length": seq_length}, **map_kwargs)
+    else:
+        raise ValueError(f"Invalid packing strategy: {strategy}. Use 'ffd' or 'wrapped'.")
+    dataset = dataset.with_format(None)
+    return dataset
+
+
+def truncate_dataset(
+    dataset: DatasetType, max_length: int, map_kwargs: Optional[dict[str, Any]] = None
+) -> DatasetType:
+    r"""
+    Truncate sequences in a dataset to a specifed `max_length`.
+
+    Args:
+        dataset (`Dataset` or `DatasetDict`):
+            Dataset to truncate.
+        seq_length (`int`):
+            Maximum sequence length to truncate to.
+        map_kwargs (`dict` or `None`, *optional*, defaults to `None`):
+            Additional keyword arguments to pass to the dataset's map method when truncating examples.
+
+    Returns:
+        `Dataset` or `DatasetDict`: The dataset with truncated sequences.
+
+    Example:
+    ```python
+    >>> from datasets import Dataset
+    >>> examples = {
+    ...     "input_ids": [[1, 2, 3], [4, 5, 6, 7], [8]],
+    ...     "attention_mask": [[0, 1, 1], [0, 0, 1, 1], [1]],
+    ... }
+    >>> dataset = Dataset.from_dict(examples)
+    >>> truncated_dataset = truncate_dataset(dataset, max_length=2)
+    >>> truncated_dataset[:]
+    {'input_ids': [[1, 2], [4, 5], [8]],
+     'attention_mask': [[0, 1], [0, 0], [1]]}
+    ```
+    """
+    if map_kwargs is None:
+        map_kwargs = {}
+    if isinstance(dataset, Dataset):
+        # Fast truncation with pyarrow
+        def truncate(examples):
+            truncated_columns = []
+            for column in examples.columns:
+                if pyarrow.types.is_list(column.type) or pyarrow.types.is_large_list(column.type):
+                    column = pc.list_slice(column, 0, max_length)
+                truncated_columns.append(column)
+            return pa.Table.from_arrays(truncated_columns, names=examples.column_names)
+
+        dataset = dataset.with_format("arrow")
+        dataset = dataset.map(truncate, batched=True, **map_kwargs)
+        dataset = dataset.with_format(None)
+    else:
+
+        def truncate(examples):
+            truncated_examples = {}
+            for key, column in examples.items():
+                if column and isinstance(column[0], list):
+                    column = [val[:max_length] for val in column]
+                truncated_examples[key] = column
+            return truncated_examples
+
+        dataset = dataset.map(
+            truncate,
+            batched=True,
+            **map_kwargs,
+        )
+    return dataset
+
+
+def maybe_convert_to_chatml(example: dict[str, list]) -> dict[str, list]:
+    """
+    Convert a conversational dataset with fields `from` and `value` to ChatML format.
+
+    This function modifies conversational data to align with OpenAI's ChatML format:
+    - Replaces the key `"from"` with `"role"` in message dictionaries.
+    - Replaces the key `"value"` with `"content"` in message dictionaries.
+    - Renames `"conversations"` to `"messages"` for consistency with ChatML.
+
+    Args:
+        example (`dict[str, list]`):
+            A single data entry containing a list of messages.
+
+    Returns:
+        `dict[str, list]`:
+            Example reformatted to ChatML style.
+
+    Example:
+    ```python
+    >>> from trl import maybe_convert_to_chatml
+    >>> example = {
+    ...     "conversations": [
+    ...         {"from": "user", "value": "What color is the sky?"},
+    ...         {"from": "assistant", "value": "It is blue."}
+    ...     ]
+    ... }
+    >>> maybe_convert_to_chatml(example)
+    {'messages': [{'role': 'user', 'content': 'What color is the sky?'},
+                  {'role': 'assistant', 'content': 'It is blue.'}]}
+    ```
+    """
+    # List of possible keys containing message lists
+    for key in ["prompt", "completion", "chosen", "rejected", "messages", "conversations"]:
+        if key in example and isinstance(example[key], list):
+            messages = example[key]
+            for message in messages:
+                if isinstance(message, dict):
+                    if "from" in message:
+                        message["role"] = message.pop("from")
+                    if "value" in message:
+                        message["content"] = message.pop("value")
+
+    # Rename "conversations" to "messages"
+    if "conversations" in example:
+        example["messages"] = example.pop("conversations")
+
+    return example

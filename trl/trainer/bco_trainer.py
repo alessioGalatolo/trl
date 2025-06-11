@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,20 +19,19 @@ import textwrap
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
-from copy import deepcopy
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
 
 import numpy as np
+import pandas as pd
 import torch
-import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
-import transformers
 from accelerate import PartialState
-from accelerate.utils import is_deepspeed_available, tqdm
+from accelerate.logging import get_logger
+from accelerate.utils import tqdm
 from datasets import Dataset
-from packaging import version
+from torch import autocast
 from torch.utils.data import DataLoader, SequentialSampler
 from transformers import (
     AutoModelForCausalLM,
@@ -44,6 +43,7 @@ from transformers import (
     ProcessorMixin,
     Trainer,
     TrainingArguments,
+    is_comet_available,
     is_sklearn_available,
     is_wandb_available,
 )
@@ -52,7 +52,8 @@ from transformers.trainer_utils import EvalLoopOutput, has_length
 from transformers.utils import is_peft_available
 
 from ..data_utils import maybe_apply_chat_template
-from ..models import PreTrainedModelWrapper, create_reference_model
+from ..import_utils import is_joblib_available
+from ..models import create_reference_model, prepare_deepspeed
 from .bco_config import BCOConfig
 from .utils import (
     DPODataCollatorWithPadding,
@@ -60,8 +61,10 @@ from .utils import (
     disable_dropout_in_model,
     generate_model_card,
     get_comet_experiment_url,
+    log_table_to_comet_experiment,
     pad_to_length,
     peft_module_casting_to_bf16,
+    selective_log_softmax,
 )
 
 
@@ -74,14 +77,16 @@ if is_wandb_available():
 if is_sklearn_available():
     from sklearn.linear_model import LogisticRegression
 
-if is_deepspeed_available():
-    import deepspeed
+if is_joblib_available():
+    import joblib
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel, PreTrainedTokenizer
 
+logger = get_logger(__name__)
+
 RUNNING_NAME = "running.json"
-CLF_NAME = "clf.pt"
+CLF_NAME = "clf.pkl"
 
 
 def _tokenize(
@@ -309,8 +314,6 @@ class BCOTrainer(Trainer):
             The function to use to preprocess the logits before computing the metrics.
         peft_config (`dict`, defaults to `None`):
             The PEFT configuration to use for training. If you pass a PEFT configuration, the model will be wrapped in a PEFT model.
-        disable_dropout (`bool`, defaults to `True`):
-            Whether or not to disable dropouts in `model` and `ref_model`.
         compute_metrics (`Callable[[EvalPrediction], dict]`, *optional*):
             The function to use to compute the metrics. Must take a `EvalPrediction` and return
             a dictionary string to metric values.
@@ -344,15 +347,15 @@ class BCOTrainer(Trainer):
         embedding_func: Optional[Callable] = None,
         embedding_tokenizer: Optional[PreTrainedTokenizerBase] = None,
     ):
-        if not is_sklearn_available():
+        if embedding_func is not None and not (is_sklearn_available() and is_joblib_available()):
             raise ImportError(
-                "BCOTrainer requires the scikit-learn library. Please install it with `pip install scikit-learn`."
+                "BCOTrainer with UDM requires the scikit-learn and joblib libraries. Please install it with `pip install scikit-learn joblib`."
             )
 
         if type(args) is TrainingArguments:
             raise ValueError("Please use `BCOConfig` instead `TrainingArguments`.")
 
-        if not isinstance(model, str) and ref_model is model:
+        if not isinstance(model, str) and model is not None and ref_model is model:
             raise ValueError(
                 "`model` and `ref_model` cannot be the same object. If you want `ref_model` to be the "
                 "same as `model`, you must mass a copy of it, or `None` if you use peft."
@@ -426,7 +429,7 @@ class BCOTrainer(Trainer):
                     prepare_model_kwargs["gradient_checkpointing_kwargs"] = args.gradient_checkpointing_kwargs
 
                 model = prepare_model_for_kbit_training(model, **prepare_model_kwargs)
-            elif getattr(args, "gradient_checkpointing", False):
+            elif args.gradient_checkpointing:
                 # For backward compatibility with older versions of transformers
                 if hasattr(model, "enable_input_require_grads"):
                     model.enable_input_require_grads()
@@ -447,7 +450,7 @@ class BCOTrainer(Trainer):
         # For models that use gradient_checkpointing, we need to attach a hook that enables input
         # to explicitly have `requires_grad=True`, otherwise training will either silently
         # fail or completely fail.
-        elif getattr(args, "gradient_checkpointing", False):
+        elif args.gradient_checkpointing:
             # For backward compatibility with older versions of transformers
             if hasattr(model, "enable_input_require_grads"):
                 model.enable_input_require_grads()
@@ -458,10 +461,10 @@ class BCOTrainer(Trainer):
 
                 model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-        if args.generate_during_eval and not is_wandb_available():
+        if args.generate_during_eval and not (is_wandb_available() or is_comet_available()):
             raise ValueError(
-                "`generate_during_eval=True` requires Weights and Biases to be installed."
-                " Please install with `pip install wandb` to resolve."
+                "`generate_during_eval=True` requires Weights and Biases or Comet to be installed."
+                " Please install `wandb` or `comet-ml` to resolve."
             )
 
         if model is not None:
@@ -538,10 +541,11 @@ class BCOTrainer(Trainer):
         else:
             self.use_dpo_data_collator = False
 
-        # disable dropout in the model and reference model
-        disable_dropout_in_model(model)
-        if self.ref_model is not None:
-            disable_dropout_in_model(self.ref_model)
+        # Disable dropout in the model and reference model
+        if args.disable_dropout:
+            disable_dropout_in_model(model)
+            if self.ref_model is not None:
+                disable_dropout_in_model(self.ref_model)
 
         self.max_length = max_length
         self.generate_during_eval = args.generate_during_eval
@@ -586,7 +590,7 @@ class BCOTrainer(Trainer):
         # issued.
         model.warnings_issued["estimate_tokens"] = True
 
-        with PartialState().local_main_process_first():
+        with PartialState().main_process_first():
             # Apply the chat template if needed
             train_dataset = train_dataset.map(
                 maybe_apply_chat_template, fn_kwargs={"tokenizer": processing_class}, num_proc=args.dataset_num_proc
@@ -597,10 +601,7 @@ class BCOTrainer(Trainer):
                     fn_kwargs={"tokenizer": processing_class},
                     num_proc=args.dataset_num_proc,
                 )
-            # Shuffle the datasets
-            train_dataset = train_dataset.shuffle(seed=args.data_seed)
-            if eval_dataset is not None:
-                eval_dataset = eval_dataset.shuffle(seed=args.data_seed)
+
             # Tokenize and prepare the training datasets
             train_dataset = train_dataset.map(
                 _tokenize,
@@ -663,9 +664,6 @@ class BCOTrainer(Trainer):
                 lambda x: not x["label"], num_proc=args.dataset_num_proc, desc="Filtering undesirable examples"
             )
 
-            desirable = desirable.shuffle(seed=args.data_seed)
-            undesirable = undesirable.shuffle(seed=args.data_seed)
-
         super().__init__(
             model=model,
             args=args,
@@ -679,6 +677,11 @@ class BCOTrainer(Trainer):
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         )
+
+        # Gradient accumulation requires scaled loss. Normally, loss scaling in the parent class depends on whether the
+        # model accepts loss-related kwargs. Since we compute our own loss, this check is irrelevant. We set
+        # self.model_accepts_loss_kwargs to False to enable scaling.
+        self.model_accepts_loss_kwargs = False
 
         # Add tags for models that have been loaded with the correct transformers version
         if hasattr(self.model, "add_model_tags"):
@@ -703,13 +706,13 @@ class BCOTrainer(Trainer):
                 )
         else:
             if self.is_deepspeed_enabled:
-                self.ref_model = self._prepare_deepspeed(self.ref_model)
+                self.ref_model = prepare_deepspeed(self.ref_model, self.accelerator)
             else:
                 self.ref_model = self.accelerator.prepare_model(self.ref_model, evaluation_mode=True)
 
         self.running = RunningMoments(accelerator=self.accelerator)
 
-        if self.embedding_func is None:
+        if self.embedding_func is None or args.resume_from_checkpoint:
             return
 
         chosen_embeddings = self._get_sample_prompt_embeddings(desirable, sample_size=self.args.prompt_sample_size)
@@ -723,6 +726,13 @@ class BCOTrainer(Trainer):
         self.clf = LogisticRegression(class_weight="balanced").fit(
             embeddings.cpu().float().numpy(), labels.cpu().numpy()
         )
+        chosen_mean = self.clf.score(
+            chosen_embeddings.cpu().float().numpy(), torch.ones_like(chosen_embeddings[:, 0]).cpu().numpy()
+        )
+        rejected_mean = self.clf.score(
+            rejected_embeddings.cpu().float().numpy(), torch.zeros_like(rejected_embeddings[:, 0]).cpu().numpy()
+        )
+        logger.info(f"UDM classifier training scores: chosen: {chosen_mean}, rejected: {rejected_mean}")
 
     @property
     def match_underlying_distribution(self):
@@ -830,53 +840,24 @@ class BCOTrainer(Trainer):
 
         return all_embeddings
 
-    def _prepare_deepspeed(self, model: PreTrainedModelWrapper):
-        # Adapted from accelerate: https://github.com/huggingface/accelerate/blob/739b135f8367becb67ffaada12fe76e3aa60fefd/src/accelerate/accelerator.py#L1473
-        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
-        config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
-
-        if model is not None:
-            if hasattr(model, "config"):
-                hidden_size = (
-                    max(model.config.hidden_sizes)
-                    if getattr(model.config, "hidden_sizes", None)
-                    else getattr(model.config, "hidden_size", None)
-                )
-                if hidden_size is not None and config_kwargs["zero_optimization"]["stage"] == 3:
-                    # Note that `stage3_prefetch_bucket_size` can produce DeepSpeed messages like: `Invalidate trace cache @ step 0: expected module 1, but got module 0`
-                    # This is expected and is not an error, see: https://github.com/microsoft/DeepSpeed/discussions/4081
-                    config_kwargs.update(
-                        {
-                            "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
-                            "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
-                            "zero_optimization.stage3_prefetch_bucket_size": 0.9 * hidden_size * hidden_size,
-                        }
-                    )
-
-        # If ZeRO-3 is used, we shard both the active and reference model.
-        # Otherwise, we assume the reference model fits in memory and is initialized on each device with ZeRO disabled (stage 0)
-        if config_kwargs["zero_optimization"]["stage"] != 3:
-            config_kwargs["zero_optimization"]["stage"] = 0
-        model, *_ = deepspeed.initialize(model=model, config=config_kwargs)
-        model.eval()
-        return model
-
     def _save_optimizer_and_scheduler(self, output_dir):
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
         super()._save_optimizer_and_scheduler(output_dir)
 
-        # When saving optimizer and scheduler to checkpoint, save also the running delta object.
-        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        if self.accelerator.is_main_process:
+            # When saving optimizer and scheduler to checkpoint, save also the running delta object.
+            self.running.save_to_json(os.path.join(output_dir, RUNNING_NAME))
 
-        self.running.save_to_json(os.path.join(output_dir, RUNNING_NAME))
-
-        if self.match_underlying_distribution:
-            torch.save(self.clf.get_params(), os.path.join(output_dir, CLF_NAME))
+            if self.match_underlying_distribution:
+                joblib.dump(self.clf, os.path.join(output_dir, CLF_NAME), compress=True)
 
     def _load_optimizer_and_scheduler(self, checkpoint):
+        if checkpoint is None:
+            logger.warning_once(f"Missing Checkpoint {checkpoint}")
+            return
+
         super()._load_optimizer_and_scheduler(checkpoint)
 
-        if checkpoint is None:
-            return
         # when loading optimizer and scheduler from checkpoint, also load the running delta object.
         running_file = os.path.join(checkpoint, RUNNING_NAME)
         if os.path.isfile(running_file):
@@ -884,15 +865,17 @@ class BCOTrainer(Trainer):
 
         if self.match_underlying_distribution:
             clf_file = os.path.join(checkpoint, CLF_NAME)
-            if os.path.isfile(running_file):
-                self.clf.set_params(**torch.load(clf_file, weights_only=True, map_location="cpu"))
+            if os.path.isfile(clf_file):
+                self.clf = joblib.load(clf_file)
 
     @contextmanager
     def null_ref_context(self):
         """Context manager for handling null reference model (that is, peft adapter manipulation)."""
-        with self.accelerator.unwrap_model(
-            self.model
-        ).disable_adapter() if self.is_peft_model and not self.ref_adapter_name else nullcontext():
+        with (
+            self.accelerator.unwrap_model(self.model).disable_adapter()
+            if self.is_peft_model and not self.ref_adapter_name
+            else nullcontext()
+        ):
             if self.ref_adapter_name:
                 self.model.set_adapter(self.ref_adapter_name)
             yield
@@ -1055,7 +1038,7 @@ class BCOTrainer(Trainer):
         # dummy token; we'll ignore the losses on these tokens later
         labels[labels == label_pad_token_id] = 0
 
-        per_token_logps = torch.gather(logits.log_softmax(-1), dim=2, index=labels.unsqueeze(2)).squeeze(2)
+        per_token_logps = selective_log_softmax(logits, labels)
 
         if average_log_prob:
             return (per_token_logps * loss_mask).sum(-1) / loss_mask.sum(-1)
@@ -1128,6 +1111,7 @@ class BCOTrainer(Trainer):
         reference_rejected_logps: torch.FloatTensor,
         chosen_embeddings: Optional[torch.FloatTensor],
         rejected_embeddings: Optional[torch.FloatTensor],
+        do_train: bool = True,
     ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
         """Compute the BCO loss for a batch of policy and reference model log probabilities.
 
@@ -1146,31 +1130,18 @@ class BCOTrainer(Trainer):
             The delta value contains the moving average of all implicit rewards.
         """
 
-        if policy_chosen_logps.shape[0] != 0 or reference_chosen_logps.shape[0] != 0:
-            chosen_logratios = policy_chosen_logps - reference_chosen_logps
-            chosen_rewards = self.beta * chosen_logratios
-        else:
-            # lists can't be empty -- if they are, then accelerate.gather will hang
-            chosen_losses = torch.Tensor([]).to(self.accelerator.device)
-            chosen_rewards = torch.Tensor([]).to(self.accelerator.device)
+        chosen_logratios = policy_chosen_logps - reference_chosen_logps
+        chosen_rewards = self.beta * chosen_logratios
 
-        if policy_rejected_logps.shape[0] != 0 or reference_rejected_logps.shape[0] != 0:
-            rejected_logratios = policy_rejected_logps - reference_rejected_logps
-            rejected_rewards = self.beta * rejected_logratios
-        else:
-            # lists can't be empty -- if they are, then accelerate.gather will hang
-            rejected_losses = torch.Tensor([]).to(self.accelerator.device)
-            rejected_rewards = torch.Tensor([]).to(self.accelerator.device)
+        rejected_logratios = policy_rejected_logps - reference_rejected_logps
+        rejected_rewards = self.beta * rejected_logratios
 
-        rewards = torch.cat((chosen_rewards, rejected_rewards), 0).mean().detach()
-        self.running.update(rewards)
-        delta = self.running.mean
+        if do_train:
+            self.running.update(torch.cat((chosen_rewards, rejected_rewards), 0).detach())
+        delta = torch.as_tensor(self.running.mean, device=chosen_rewards.device)
 
-        if policy_chosen_logps.shape[0] != 0 or reference_chosen_logps.shape[0] != 0:
-            chosen_losses = -F.logsigmoid(chosen_rewards - delta)
-
-        if policy_rejected_logps.shape[0] != 0 or reference_rejected_logps.shape[0] != 0:
-            rejected_losses = -F.logsigmoid(-(rejected_rewards - delta))
+        chosen_losses = -F.logsigmoid(chosen_rewards - delta)
+        rejected_losses = -F.logsigmoid(-(rejected_rewards - delta))
 
         if self.match_underlying_distribution:
             chosen_weight = torch.ones_like(chosen_losses)
@@ -1180,12 +1151,13 @@ class BCOTrainer(Trainer):
         else:
             losses = torch.cat((chosen_losses, rejected_losses), dim=0)
 
-        return losses, chosen_rewards, rejected_rewards, torch.as_tensor(delta)
+        return losses, chosen_rewards, rejected_rewards, delta
 
     def get_batch_loss_metrics(
         self,
         model,
         batch: dict[str, Union[list, torch.LongTensor]],
+        do_train: bool = True,
     ):
         """Compute the BCO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
@@ -1235,25 +1207,38 @@ class BCOTrainer(Trainer):
             reference_rejected_logps,
             chosen_embeddings,
             rejected_embeddings,
+            do_train=do_train,
         )
-        metrics["delta"] = delta.item()
+        metrics["delta"] = self.accelerator.gather_for_metrics(delta).mean().item()
 
         num_chosen = torch.Tensor([len(chosen_rewards)]).to(self.accelerator.device)
         num_rejected = torch.Tensor([len(rejected_rewards)]).to(self.accelerator.device)
 
-        all_num_chosen = self.accelerator.gather(num_chosen).sum().item()
-        all_num_rejected = self.accelerator.gather(num_rejected).sum().item()
+        all_num_chosen = self.accelerator.gather_for_metrics(num_chosen).sum().item()
+        all_num_rejected = self.accelerator.gather_for_metrics(num_rejected).sum().item()
 
         if all_num_chosen > 0:
-            metrics["rewards/chosen_sum"] = self.accelerator.gather(chosen_rewards.nansum()).nansum().item()
-            metrics["logps/chosen_sum"] = self.accelerator.gather(policy_chosen_logps.nansum()).nansum().item()
-            metrics["logits/chosen_sum"] = self.accelerator.gather(policy_chosen_logits.nansum()).nansum().item()
+            metrics["rewards/chosen_sum"] = (
+                self.accelerator.gather_for_metrics(chosen_rewards.nansum()).nansum().item()
+            )
+            metrics["logps/chosen_sum"] = (
+                self.accelerator.gather_for_metrics(policy_chosen_logps.nansum()).nansum().item()
+            )
+            metrics["logits/chosen_sum"] = (
+                self.accelerator.gather_for_metrics(policy_chosen_logits.nansum()).nansum().item()
+            )
             metrics["count/chosen"] = all_num_chosen
 
         if all_num_rejected > 0:
-            metrics["rewards/rejected_sum"] = self.accelerator.gather(rejected_rewards.nansum()).nansum().item()
-            metrics["logps/rejected_sum"] = self.accelerator.gather(policy_rejected_logps.nansum()).nansum().item()
-            metrics["logits/rejected_sum"] = self.accelerator.gather(policy_rejected_logits.nansum()).nansum().item()
+            metrics["rewards/rejected_sum"] = (
+                self.accelerator.gather_for_metrics(rejected_rewards.nansum()).nansum().item()
+            )
+            metrics["logps/rejected_sum"] = (
+                self.accelerator.gather_for_metrics(policy_rejected_logps.nansum()).nansum().item()
+            )
+            metrics["logits/rejected_sum"] = (
+                self.accelerator.gather_for_metrics(policy_rejected_logits.nansum()).nansum().item()
+            )
             metrics["count/rejected"] = all_num_rejected
 
         loss = losses.nanmean()
@@ -1269,7 +1254,9 @@ class BCOTrainer(Trainer):
         return_outputs=False,
         num_items_in_batch=None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, dict[str, torch.Tensor]]]:
-        compute_loss_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
+        compute_loss_context_manager = (
+            autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
+        )
 
         with compute_loss_context_manager:
             loss, metrics = self.get_batch_loss_metrics(model, inputs)
@@ -1288,17 +1275,21 @@ class BCOTrainer(Trainer):
         for key, value in metrics.items():
             self._stored_metrics[train_eval][key].append(value)
 
-    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        if self.train_dataset is None or not has_length(self.train_dataset):
+    def _get_train_sampler(self, dataset: Optional[Dataset] = None) -> Optional[torch.utils.data.Sampler]:
+        if dataset is None:
+            dataset = self.train_dataset
+        if dataset is None or not has_length(dataset):
             return None
-        return SequentialSampler(self.train_dataset)
+        return SequentialSampler(dataset)
 
     def generate_from_model_and_ref(self, model, batch: dict[str, torch.LongTensor]) -> tuple[str, str]:
         """Generate samples from the model and reference model for the given batch of inputs."""
 
         # If one uses `generate_during_eval` with peft + bf16, we need to explicitly call generate with
-        # the torch cuda amp context manager as some hidden states are silently casted to full precision.
-        generate_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
+        # the torch amp context manager as some hidden states are silently casted to full precision.
+        generate_context_manager = (
+            autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
+        )
         with generate_context_manager:
             policy_output = model.generate(
                 input_ids=batch["prompt_input_ids"],
@@ -1351,9 +1342,11 @@ class BCOTrainer(Trainer):
             else:
                 ignore_keys = []
 
-        prediction_context_manager = amp.autocast("cuda") if self._peft_has_been_casted_to_bf16 else nullcontext()
+        prediction_context_manager = (
+            autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
+        )
         with torch.no_grad(), prediction_context_manager:
-            loss, metrics = self.get_batch_loss_metrics(model, inputs)
+            loss, metrics = self.get_batch_loss_metrics(model, inputs, do_train=False)
 
         # force log the metrics
         if self.accelerator.is_main_process:
@@ -1363,12 +1356,13 @@ class BCOTrainer(Trainer):
             return (loss.detach(), None, None)
 
         # logits for the chosen and rejected samples from model
-        logits_dict = {
-            "eval_logits/chosen": metrics["logits/chosen"],
-            "eval_logits/rejected": metrics["logits/rejected"],
-        }
-        logits = tuple(v.unsqueeze(dim=0) for k, v in logits_dict.items() if k not in ignore_keys)
-        logits = torch.stack(logits).mean(axis=1).to(self.accelerator.device)
+        logits_dict = {}
+        if "logits/chosen_sum" in metrics:
+            logits_dict["eval_logits/chosen"] = metrics["logits/chosen_sum"]
+        if "logits/rejected_sum" in metrics:
+            logits_dict["eval_logits/rejected"] = metrics["logits/rejected_sum"]
+        logits = [v for k, v in logits_dict.items() if k not in ignore_keys]
+        logits = torch.tensor(logits, device=self.accelerator.device)
         labels = torch.zeros(logits.shape[0], device=self.accelerator.device)
 
         return (loss.detach(), logits, labels)
@@ -1399,28 +1393,29 @@ class BCOTrainer(Trainer):
             random_batch = self.data_collator(random_batch_dataset)
             random_batch = self._prepare_inputs(random_batch)
 
-            target_indicies = [i for i in range(len(random_batch["delta"])) if random_batch["delta"][i] is False]
+            target_indicies = [i for i in range(len(random_batch["label"])) if random_batch["label"][i] is False]
             target_batch = {
-                "prompt_input_ids": itemgetter(*target_indicies)(random_batch["prompt_input_ids"]),
-                "prompt_attention_mask": itemgetter(*target_indicies)(random_batch["prompt_attention_mask"]),
+                "prompt_input_ids": random_batch["prompt_input_ids"][target_indicies],
+                "prompt_attention_mask": random_batch["prompt_attention_mask"][target_indicies],
                 "prompt": itemgetter(*target_indicies)(random_batch["prompt"]),
             }
             policy_output_decoded, ref_output_decoded = self.generate_from_model_and_ref(self.model, target_batch)
 
-            self.log(
-                {
-                    "game_log": wandb.Table(
-                        columns=["Prompt", "Policy", "Ref Model"],
-                        rows=[
-                            [prompt, pol[len(prompt) :], ref[len(prompt) :]]
-                            for prompt, pol, ref in zip(
-                                target_batch["prompt"], policy_output_decoded, ref_output_decoded
-                            )
-                        ],
-                    )
-                }
+            table = pd.DataFrame(
+                columns=["Prompt", "Policy", "Ref Model"],
+                data=[
+                    [prompt, pol[len(prompt) :], ref[len(prompt) :]]
+                    for prompt, pol, ref in zip(target_batch["prompt"], policy_output_decoded, ref_output_decoded)
+                ],
             )
-            self.state.log_history.pop()
+            if "wandb" in self.args.report_to:
+                wandb.log({"game_log": wandb.Table(data=table)})
+
+            if "comet_ml" in self.args.report_to:
+                log_table_to_comet_experiment(
+                    name="game_log.csv",
+                    table=table,
+                )
 
         # Base evaluation
         initial_output = super().evaluation_loop(
@@ -1462,11 +1457,7 @@ class BCOTrainer(Trainer):
         for key, metrics in self._stored_metrics[train_eval].items():
             logs[f"{prefix}{key}"] = torch.Tensor(metrics).mean().item()
         del self._stored_metrics[train_eval]
-
-        if version.parse(transformers.__version__) >= version.parse("4.47.0.dev0"):
-            return super().log(logs, start_time)
-        else:  # transformers<=4.46
-            return super().log(logs)
+        return super().log(logs, start_time)
 
     def create_model_card(
         self,
@@ -1478,11 +1469,11 @@ class BCOTrainer(Trainer):
         Creates a draft of a model card using the information available to the `Trainer`.
 
         Args:
-            model_name (`str`, *optional*, defaults to `None`):
-                The name of the model.
-            dataset_name (`str`, *optional*, defaults to `None`):
-                The name of the dataset used for training.
-            tags (`str`, `list[str]` or None, *optional*, defaults to `None`):
+            model_name (`str` or `None`, *optional*, defaults to `None`):
+                Name of the model.
+            dataset_name (`str` or `None`, *optional*, defaults to `None`):
+                Name of the dataset used for training.
+            tags (`str`, `list[str]` or `None`, *optional*, defaults to `None`):
                 Tags to be associated with the model card.
         """
         if not self.is_world_process_zero():

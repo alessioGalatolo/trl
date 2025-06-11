@@ -1,4 +1,4 @@
-# Copyright 2024 The HuggingFace Team. All rights reserved.
+# Copyright 2020-2025 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,16 +17,19 @@ import itertools
 import tempfile
 import unittest
 
+import pytest
 import torch
 from accelerate.utils.memory import release_memory
 from datasets import load_dataset
 from parameterized import parameterized
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from transformers.testing_utils import (
+    backend_empty_cache,
     require_liger_kernel,
     require_peft,
     require_torch_accelerator,
     require_torch_multi_accelerator,
+    torch_device,
 )
 from transformers.utils import is_peft_available
 
@@ -41,12 +44,14 @@ if is_peft_available():
     from peft import LoraConfig, PeftModel
 
 
+@pytest.mark.slow
 @require_torch_accelerator
+@require_peft
 class SFTTrainerSlowTester(unittest.TestCase):
     def setUp(self):
         self.train_dataset = load_dataset("stanfordnlp/imdb", split="train[:10%]")
         self.eval_dataset = load_dataset("stanfordnlp/imdb", split="test[:10%]")
-        self.max_seq_length = 128
+        self.max_length = 128
         self.peft_config = LoraConfig(
             lora_alpha=16,
             lora_dropout=0.1,
@@ -57,7 +62,7 @@ class SFTTrainerSlowTester(unittest.TestCase):
 
     def tearDown(self):
         gc.collect()
-        torch.cuda.empty_cache()
+        backend_empty_cache(torch_device)
         gc.collect()
 
     @parameterized.expand(list(itertools.product(MODELS_TO_TEST, PACKING_OPTIONS)))
@@ -74,7 +79,7 @@ class SFTTrainerSlowTester(unittest.TestCase):
                 per_device_train_batch_size=2,
                 max_steps=10,
                 packing=packing,
-                max_seq_length=self.max_seq_length,
+                max_length=self.max_length,
             )
 
             trainer = SFTTrainer(
@@ -100,12 +105,11 @@ class SFTTrainerSlowTester(unittest.TestCase):
                 per_device_train_batch_size=2,
                 max_steps=10,
                 packing=packing,
-                max_seq_length=self.max_seq_length,
+                max_length=self.max_length,
             )
 
             model = AutoModelForCausalLM.from_pretrained(model_name)
             tokenizer = AutoTokenizer.from_pretrained(model_name)
-            tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
 
             trainer = SFTTrainer(
                 model,
@@ -135,12 +139,11 @@ class SFTTrainerSlowTester(unittest.TestCase):
                 max_steps=10,
                 fp16=True,
                 packing=packing,
-                max_seq_length=self.max_seq_length,
+                max_length=self.max_length,
             )
 
             model = AutoModelForCausalLM.from_pretrained(model_name)
             tokenizer = AutoTokenizer.from_pretrained(model_name)
-            tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
 
             trainer = SFTTrainer(
                 model,
@@ -172,12 +175,11 @@ class SFTTrainerSlowTester(unittest.TestCase):
                 max_steps=10,
                 fp16=True,  # this is sufficient to enable amp
                 packing=packing,
-                max_seq_length=self.max_seq_length,
+                max_length=self.max_length,
             )
 
             model = AutoModelForCausalLM.from_pretrained(model_name)
             tokenizer = AutoTokenizer.from_pretrained(model_name)
-            tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
 
             trainer = SFTTrainer(
                 model,
@@ -205,7 +207,7 @@ class SFTTrainerSlowTester(unittest.TestCase):
                 per_device_train_batch_size=2,
                 max_steps=10,
                 packing=packing,
-                max_seq_length=self.max_seq_length,
+                max_length=self.max_length,
                 fp16=True,  # this is sufficient to enable amp
                 gradient_checkpointing=True,
                 gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
@@ -213,7 +215,6 @@ class SFTTrainerSlowTester(unittest.TestCase):
 
             model = AutoModelForCausalLM.from_pretrained(model_name)
             tokenizer = AutoTokenizer.from_pretrained(model_name)
-            tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
 
             trainer = SFTTrainer(
                 model,
@@ -242,7 +243,7 @@ class SFTTrainerSlowTester(unittest.TestCase):
                 per_device_train_batch_size=2,
                 max_steps=10,
                 packing=packing,
-                max_seq_length=self.max_seq_length,
+                max_length=self.max_length,
                 fp16=True,  # this is sufficient to enable amp
                 gradient_checkpointing=True,
                 gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
@@ -250,7 +251,6 @@ class SFTTrainerSlowTester(unittest.TestCase):
 
             model = AutoModelForCausalLM.from_pretrained(model_name)
             tokenizer = AutoTokenizer.from_pretrained(model_name)
-            tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
 
             trainer = SFTTrainer(
                 model,
@@ -286,7 +286,7 @@ class SFTTrainerSlowTester(unittest.TestCase):
                 per_device_train_batch_size=2,
                 max_steps=10,
                 packing=packing,
-                max_seq_length=self.max_seq_length,
+                max_length=self.max_length,
                 fp16=True,  # this is sufficient to enable amp
                 gradient_checkpointing=True,
                 gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
@@ -294,7 +294,6 @@ class SFTTrainerSlowTester(unittest.TestCase):
 
             model = AutoModelForCausalLM.from_pretrained(model_name, device_map=device_map)
             tokenizer = AutoTokenizer.from_pretrained(model_name)
-            tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
 
             trainer = SFTTrainer(
                 model,
@@ -324,7 +323,7 @@ class SFTTrainerSlowTester(unittest.TestCase):
                 per_device_train_batch_size=2,
                 max_steps=10,
                 packing=packing,
-                max_seq_length=self.max_seq_length,
+                max_length=self.max_length,
                 fp16=True,  # this is sufficient to enable amp
                 gradient_checkpointing=True,
                 gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
@@ -334,7 +333,6 @@ class SFTTrainerSlowTester(unittest.TestCase):
 
             model = AutoModelForCausalLM.from_pretrained(model_name, quantization_config=quantization_config)
             tokenizer = AutoTokenizer.from_pretrained(model_name)
-            tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
 
             trainer = SFTTrainer(
                 model,
@@ -364,7 +362,7 @@ class SFTTrainerSlowTester(unittest.TestCase):
 
             training_args = SFTConfig(
                 packing=packing,
-                max_seq_length=self.max_seq_length,
+                max_length=self.max_length,
                 output_dir=tmp_dir,
                 logging_strategy="no",
                 report_to="none",
@@ -380,7 +378,6 @@ class SFTTrainerSlowTester(unittest.TestCase):
 
             if tokenizer.chat_template is None:
                 model, tokenizer = setup_chat_format(model, tokenizer)
-            tokenizer.pad_token = tokenizer.eos_token if tokenizer.pad_token is None else tokenizer.pad_token
 
             trainer = SFTTrainer(
                 model,
@@ -411,8 +408,8 @@ class SFTTrainerSlowTester(unittest.TestCase):
                 per_device_train_batch_size=2,
                 max_steps=2,
                 packing=packing,
-                max_seq_length=self.max_seq_length,
-                use_liger=True,
+                max_length=self.max_length,
+                use_liger_kernel=True,
             )
 
             trainer = SFTTrainer(
@@ -422,8 +419,42 @@ class SFTTrainerSlowTester(unittest.TestCase):
                 eval_dataset=self.eval_dataset,
             )
 
-            # check that the components of the trainer.model are monkey patched:
-            self.assertTrue(any("Liger" in type(module).__name__ for module in trainer.model.model.modules()))
             trainer.train()
 
         release_memory(trainer.model, trainer)
+
+    @parameterized.expand(list(itertools.product(MODELS_TO_TEST, PACKING_OPTIONS)))
+    @require_torch_accelerator
+    def test_train_offloading(self, model_name, packing):
+        """Test that activation offloading works with SFTTrainer."""
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # Initialize the trainer
+            training_args = SFTConfig(
+                output_dir=tmp_dir,
+                activation_offloading=True,
+                report_to="none",
+                per_device_train_batch_size=2,
+                max_steps=2,
+                packing=packing,
+                max_length=self.max_length,
+            )
+            trainer = SFTTrainer(
+                model=model_name, args=training_args, train_dataset=self.train_dataset, eval_dataset=self.eval_dataset
+            )
+
+            # Save the initial parameters to compare them later
+            previous_trainable_params = {n: param.clone() for n, param in trainer.model.named_parameters()}
+
+            # Train the model
+            trainer.train()
+
+            # Check that the training loss is not None
+            self.assertIsNotNone(trainer.state.log_history[-1]["train_loss"])
+
+            # Check the params have changed
+            for n, param in previous_trainable_params.items():
+                new_param = trainer.model.get_parameter(n)
+                self.assertFalse(torch.allclose(param, new_param), f"Parameter {n} has not changed")
+
+            release_memory(trainer.model, trainer)
